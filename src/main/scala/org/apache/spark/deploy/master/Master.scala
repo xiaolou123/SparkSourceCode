@@ -321,8 +321,10 @@ private[spark] class Master(
         // ignore, don't send response
       } else {
         logInfo("Registering app " + description.name)
-        // 用ApplicationInfo加入缓存，将Application加入等待调度的队列--waitingApps
+        // 用ApplicationDescrition信息，创建ApplicationInfo
         val app = createApplication(description, sender)
+        // 注册Application
+        // 用ApplicationInfo加入缓存，将Application加入等待调度的队列--waitingApps
         registerApplication(app)
         logInfo("Registered app " + description.name + " with ID " + app.id)
         // 使用持久化引擎，将ApplicationInfo进行持久化
@@ -560,7 +562,7 @@ private[spark] class Master(
     //也就是说，standby master是不会进行application的资源调度的 
     if (state != RecoveryState.ALIVE) { return }
 
-    //Random.shuffle的原理，大家要清楚们就是对传入的集合的元素进行随机的打乱
+    //Random.shuffle的原理，大家要清楚就是对传入的集合的元素进行随机的打乱
     //去除了workers中的所有之前注册上来的worker，进行过滤，必须是状态为ALIVE的worker
     //对状态为ALIVE的worker，调用Random的shuffle方法进行随机的打乱
     val shuffledAliveWorkers = Random.shuffle(workers.toSeq.filter(_.state == WorkerState.ALIVE))
@@ -579,7 +581,7 @@ private[spark] class Master(
       var numWorkersVisited = 0
       
       //while的条件，numWorkersVisited小于numWorkersAlive
-      //什么意思？就是说，只要还有活着的worker没有遍历到，那么久继续进行遍历吗，对不对？
+      //什么意思？就是说，只要还有活着的worker没有遍历到，那么就继续进行遍历吗，对不对？
       //而且，意思是，当前这个driver还没有被启动，也就是launched为false
       while (numWorkersVisited < numWorkersAlive && !launched) {
         val worker = shuffledAliveWorkers(curPos)
@@ -600,7 +602,7 @@ private[spark] class Master(
     if (spreadOutApps) {
       // Try to spread out each app among all the nodes, until it has all its cores
       for (app <- waitingApps if app.coresLeft > 0) {
-        //从workers中，过滤出状态为ALIVE的，再次国立可以被Application使用的Worker，然后按照剩余cpu数量倒序排序
+        //从workers中，过滤出状态为ALIVE的，再次过滤可以被Application使用的Worker，然后按照剩余cpu数量倒序排序
         val usableWorkers = workers.toArray.filter(_.state == WorkerState.ALIVE)
           .filter(canUse(app, _)).sortBy(_.coresFree).reverse
         val numUsable = usableWorkers.length
@@ -610,7 +612,7 @@ private[spark] class Master(
         var toAssign = math.min(app.coresLeft, usableWorkers.map(_.coresFree).sum)
         
         //通过这种算法，其实会将每个application，要启动的executor，都平均分布到各个worker上去
-        //比如有20个cpu core要分配到10个worker，那么实际会循环两边worker，每次玄幻，给每个worker分配1个core
+        //比如有20个cpu core要分配到10个worker，那么实际会循环两遍worker，每次循环，给每个worker分配1个core
         //最后每个worker分配了2个core
         
         //while条件，只要要分配的cpu，还没分配完，就继续循环
@@ -655,9 +657,12 @@ private[spark] class Master(
 
   def launchExecutor(worker: WorkerInfo, exec: ExecutorDesc) {
     logInfo("Launching executor " + exec.fullId + " on worker " + worker.id)
+    //将executor加入worker内部的缓存
     worker.addExecutor(exec)
+    //向worker的actor发送LaunchExecutor消息
     worker.actor ! LaunchExecutor(masterUrl,
       exec.application.id, exec.id, exec.application.desc, exec.cores, exec.memory)
+    //向executor对应的application的driver，发送ExecutorAdd消息
     exec.application.driver ! ExecutorAdded(
       exec.id, worker.id, worker.hostPort, exec.cores, exec.memory)
   }
@@ -891,9 +896,14 @@ private[spark] class Master(
 
   def launchDriver(worker: WorkerInfo, driver: DriverInfo) {
     logInfo("Launching driver " + driver.id + " on worker " + worker.id)
+    //将driver加入worker内存的缓存结构
+    //将worker内使用的内存和cpu数量，都加上driver需要的内存cpu数量
     worker.addDriver(driver)
+    //同时把worker也加入到driver内部的缓存结构中
     driver.worker = Some(worker)
+    //然后调用worker的actor，给它发送LaunchDriver消息，让Worker来启动Driver
     worker.actor ! LaunchDriver(driver.id, driver.desc)
+    // 将Driver的状态设置为RUNNING
     driver.state = DriverState.RUNNING
   }
 
@@ -909,10 +919,17 @@ private[spark] class Master(
           val toRemove = math.max(RETAINED_DRIVERS / 10, 1)
           completedDrivers.trimStart(toRemove)
         }
+        
+        //向completedDrivers中加入driver
         completedDrivers += driver
+        // 使用持久化引擎取出driver的持久化信息
         persistenceEngine.removeDriver(driver)
+        
+        //设置driver的state、exception
         driver.state = finalState
         driver.exception = exception
+        
+        //将driver所在的worker，移除driver
         driver.worker.foreach(w => w.removeDriver(driver))
         schedule()
       case None =>

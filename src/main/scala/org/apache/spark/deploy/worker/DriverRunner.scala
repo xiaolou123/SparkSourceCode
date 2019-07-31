@@ -37,6 +37,9 @@ import org.apache.spark.util.{Clock, SystemClock}
  * Manages the execution of one driver, including automatically restarting the driver on failure.
  * This is currently only used in standalone cluster deploy mode.
  */
+/**
+ * 管理一个Driver的执行，包括再driver失败时自动重启Driver。目前，这种方式适用于standalone模式
+ */
 private[spark] class DriverRunner(
     val conf: SparkConf,
     val driverId: String,
@@ -174,6 +177,7 @@ private[spark] class DriverRunner(
     builder.directory(baseDir)
     def initialize(process: Process) = {
       // Redirect stdout and stderr to files
+      // 重定向stdout和stderr输出流到文件中
       val stdout = new File(baseDir, "stdout")
       CommandUtils.redirectStream(process.getInputStream, stdout)
 
@@ -205,6 +209,7 @@ private[spark] class DriverRunner(
       }
 
       val processStart = clock.getTimeMillis()
+      // 启动Driver进程
       val exitCode = process.get.waitFor()
       if (clock.getTimeMillis() - processStart > successfulRunDuration * 1000) {
         waitSeconds = 1

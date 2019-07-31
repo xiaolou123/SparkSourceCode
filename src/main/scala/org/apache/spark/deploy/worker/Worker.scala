@@ -394,16 +394,22 @@ private[spark] class Worker(
       }
 
     case ExecutorStateChanged(appId, execId, state, message, exitStatus) =>
+      // 直接向master也发送一个ExecutorStateChanged消息
       master ! ExecutorStateChanged(appId, execId, state, message, exitStatus)
       val fullId = appId + "/" + execId
+      
+      //如果executor状态时finished
       if (ExecutorState.isFinished(state)) {
         executors.get(fullId) match {
           case Some(executor) =>
             logInfo("Executor " + fullId + " finished with state " + state +
               message.map(" message " + _).getOrElse("") +
               exitStatus.map(" exitStatus " + _).getOrElse(""))
+            //将executor从内存缓存中移除
             executors -= fullId
             finishedExecutors(fullId) = executor
+            
+            // 释放executor占用的内存和cpu资源
             coresUsed -= executor.cores
             memoryUsed -= executor.memory
           case None =>
