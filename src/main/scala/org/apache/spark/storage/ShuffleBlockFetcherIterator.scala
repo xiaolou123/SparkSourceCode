@@ -136,6 +136,9 @@ final class ShuffleBlockFetcherIterator(
     }
   }
 
+  /**
+   * 发送请求到远程去获取数据
+   */
   private[this] def sendRequest(req: FetchRequest) {
     logDebug("Sending request for %d blocks (%s) from %s".format(
       req.blocks.size, Utils.bytesToString(req.size), req.address.hostPort))
@@ -247,16 +250,25 @@ final class ShuffleBlockFetcherIterator(
     }
   }
 
+  /**
+   * 将这个方法作为入口，开始拉取ResultTask对应的多份数据
+   */
   private[this] def initialize(): Unit = {
     // Add a task completion callback (called in both success case and failure case) to cleanup.
     context.addTaskCompletionListener(_ => cleanup())
 
     // Split local and remote blocks.
+    // 切分本地的和远程的block
     val remoteRequests = splitLocalRemoteBlocks()
     // Add the remote requests into our queue in a random order
+    // 切分完block之后，进行随机排序操作
     fetchRequests ++= Utils.randomize(remoteRequests)
 
     // Send out initial requests for blocks, up to our maxBytesInFlight
+    // 循环往复，主要发现还有数据没有拉取完，就发送请求到远程去拉取数据
+    // 这里很重要，有一个参数，后面讲调优的时候，是要讲的
+    // 就是max.bytes.in.flight这么一个参数，这个参数就决定了，最多能拉取多少数据到本地
+    // 就要开始进行自定义的reduce算子的处理
     while (fetchRequests.nonEmpty &&
       (bytesInFlight == 0 || bytesInFlight + fetchRequests.front.size <= maxBytesInFlight)) {
       sendRequest(fetchRequests.dequeue())
@@ -266,6 +278,7 @@ final class ShuffleBlockFetcherIterator(
     logInfo("Started " + numFetches + " remote fetches in" + Utils.getUsedTimeMs(startTime))
 
     // Get Local Blocks
+    // 拉取完了远程数据之后，获取本地的数据（数据本地化）
     fetchLocalBlocks()
     logDebug("Got local blocks in " + Utils.getUsedTimeMs(startTime))
   }

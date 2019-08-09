@@ -35,6 +35,9 @@ import org.apache.spark.scheduler.TaskDescription
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
 import org.apache.spark.util.{ActorLogReceive, AkkaUtils, SignalLogger, Utils}
 
+/**
+ * worker中为application启动的executor，实际上是启动了这个CoarseGrainedExecutorBackend进程
+ */
 private[spark] class CoarseGrainedExecutorBackend(
     driverUrl: String,
     executorId: String,
@@ -49,9 +52,14 @@ private[spark] class CoarseGrainedExecutorBackend(
   var executor: Executor = null
   var driver: ActorSelection = null
 
+  /**
+   * 在actor的初始化方法中
+   */
   override def preStart() {
     logInfo("Connecting to driver: " + driverUrl)
+    // 获取了driver的actor
     driver = context.actorSelection(driverUrl)
+    // 向driver发送RegisterExecutor消息
     driver ! RegisterExecutor(executorId, hostPort, cores, extractLogUrls)
     context.system.eventStream.subscribe(self, classOf[RemotingLifecycleEvent])
   }
@@ -63,6 +71,9 @@ private[spark] class CoarseGrainedExecutorBackend(
   }
 
   override def receiveWithLogging = {
+    // driver注册executor成功之后，会发送回来RegisteredExecutor消息
+    // 此时，CoarseGrainedExecutorBackend,会创建Executor对象，作为执行句柄
+    // 其实它的大部分功能，都是通过Executor实现的
     case RegisteredExecutor =>
       logInfo("Successfully registered with driver")
       val (hostname, _) = Utils.parseHostPort(hostPort)
@@ -72,14 +83,17 @@ private[spark] class CoarseGrainedExecutorBackend(
       logError("Slave registration failed: " + message)
       System.exit(1)
 
+    // 启动task
     case LaunchTask(data) =>
       if (executor == null) {
         logError("Received LaunchTask command but executor was null")
         System.exit(1)
       } else {
+        // 反序列化task
         val ser = env.closureSerializer.newInstance()
         val taskDesc = ser.deserialize[TaskDescription](data.value)
         logInfo("Got assigned task " + taskDesc.taskId)
+        // 用内部的执行句柄，Executor的launchTask()方法，来启动一个task
         executor.launchTask(this, taskId = taskDesc.taskId, attemptNumber = taskDesc.attemptNumber,
           taskDesc.name, taskDesc.serializedTask)
       }
@@ -107,6 +121,10 @@ private[spark] class CoarseGrainedExecutorBackend(
       context.system.shutdown()
   }
 
+  // 这里CoarseGrainedSchedulerBackend是driver
+  /**
+   * 这里会发送StatusUpdate消息，给SparkDeploySchedulerBackend
+   */
   override def statusUpdate(taskId: Long, state: TaskState, data: ByteBuffer) {
     driver ! StatusUpdate(executorId, taskId, state, data)
   }

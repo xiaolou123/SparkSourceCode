@@ -951,6 +951,7 @@ private[spark] class DAGScheduler(
       logDebug("New pending tasks: " + stage.pendingTasks)
       
       //最后，针对stage的task，创建TaskSet对象，调用TaskScheduler的submitTasks()方法，提交TaskSet
+      //默认情况下，我们的standalone模式，是使用的TaskSchedulerImpl，TaskScheduler只是一个trait
       taskScheduler.submitTasks(
         new TaskSet(tasks.toArray, stage.id, stage.newAttemptId(), stage.jobId, properties))
       stage.latestInfo.submissionTime = Some(clock.getTimeMillis())

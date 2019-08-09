@@ -113,6 +113,9 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val actorSyste
           makeOffers()
         }
 
+      /**
+       * 处理task执行结果的事件      
+       */
       case StatusUpdate(executorId, taskId, state, data) =>
         scheduler.statusUpdate(taskId, state, data.value)
         if (TaskState.isFinished(state)) {
@@ -164,6 +167,13 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val actorSyste
 
     // Make fake resource offers on all executors
     def makeOffers() {
+      // 第一步，调用TaskSchedulerImpl的resourceOffers()方法，执行任务分配算法，将各个task分配到executor上去
+      // 第二步，分配好task到executor之后，执行自己的launchTasks()方法，将分配的task发送LaunchTask消息到
+      // 对应的executor上去，有executor启动并执行
+      
+      // 给resourceOffers方法传入的是什么？
+      // 传入的是这个Application所有可用的executor，并且将其封装成了WorkerOffer，每个WorkerOffer代表了
+      // 每个executor可用的cpu资源数量
       launchTasks(scheduler.resourceOffers(executorDataMap.map { case (id, executorData) =>
         new WorkerOffer(id, executorData.executorHost, executorData.freeCores)
       }.toSeq))
@@ -177,8 +187,12 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val actorSyste
     }
 
     // Launch tasks returned by a set of resource offers
+    /**
+     * 根据分配好的情况，去在executor上启动相应的task
+     */
     def launchTasks(tasks: Seq[Seq[TaskDescription]]) {
       for (task <- tasks.flatten) {
+        // 首先将每个executor要执行 的task信息，统一进行序列化操作
         val ser = SparkEnv.get.closureSerializer.newInstance()
         val serializedTask = ser.serialize(task)
         if (serializedTask.limit >= akkaFrameSize - AkkaUtils.reservedSizeBytes) {
@@ -197,8 +211,11 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val actorSyste
           }
         }
         else {
+          // 找到对应的executor
           val executorData = executorDataMap(task.executorId)
+          // 给executor上的资源，减去要使用的cpu资源
           executorData.freeCores -= scheduler.CPUS_PER_TASK
+          // 向executor发送LaunchTask消息，来在executor上启动task
           executorData.executorActor ! LaunchTask(new SerializableBuffer(serializedTask))
         }
       }

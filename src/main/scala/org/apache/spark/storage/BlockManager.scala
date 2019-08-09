@@ -62,6 +62,10 @@ private[spark] class BlockResult(
  *
  * Note that #initialize() must be called before the BlockManager is usable.
  */
+/**
+ * BlockManager运行在每个节点上，包括driver和executor，都会有一份，主要提供了在本地或者远程存取数据的功能
+ * 支持内存、磁盘、对外存储(Tychyon)
+ */
 private[spark] class BlockManager(
     executorId: String,
     actorSystem: ActorSystem,
@@ -78,6 +82,10 @@ private[spark] class BlockManager(
 
   val diskBlockManager = new DiskBlockManager(this, conf)
 
+  // 这里还有一个东西
+  // 就是每个BlockManager，自己，会维护一个map
+  // 其中，其实就是相当于，在内存中，存放了数据，一个一个的block块
+  // 每个BlockInfo中，是不是就封装了Block的数据 
   private val blockInfo = new TimeStampedHashMap[BlockId, BlockInfo]
 
   // Actual storage of where blocks are kept
@@ -190,9 +198,20 @@ private[spark] class BlockManager(
    * service if configured.
    */
   def initialize(appId: String): Unit = {
+    // 不好意思，上一讲，将BlockManager的架构的时候，犯了一个小错误
+    // 因为我们这里都是针对spark 1.3.0版本的源码进行剖析，已经属于sprak比较新的版本了
+    // 但是我记错了，旧的版本中，BlockManager是使用BlockManagerWorker，来针对远程的BlockManager进行数据传输的
+    // 但是在spark 1.3.0版本中，已经更新为了BlockTransferService
+    // ok，但是问题不大
+    // 大家只要将上一讲中说的BlockManagerWorker，替换为BlockTransferService即可
+    
+    // 所以，首先初始化，用于进行远程block数据传输的BlockTransferService
     blockTransferService.init(this)
     shuffleClient.init(appId)
 
+    // 为当前这个BlockManager，创建一个唯一的BlockManagerId
+    // 使用到了哪些东西？executorId（每个BlockManager都关联一个Executor，BlockTransferService的hostname，以及BlockTransferService的port）
+    // 所以，从BlockManagerId的初始化即可看出，一个BlockManager是通过一个节点上的Executor来唯一标识的
     blockManagerId = BlockManagerId(
       executorId, blockTransferService.hostName, blockTransferService.port)
 
@@ -202,6 +221,8 @@ private[spark] class BlockManager(
       blockManagerId
     }
 
+    // 使用BlockManagerMasterActor的引用，进行BlockManager的注册
+    // 发送消息到BlockManagerMasterActor
     master.registerBlockManager(blockManagerId, maxMemory, slaveActor)
 
     // Register Executors' configuration with the local shuffle service, if one should exist.
@@ -452,9 +473,14 @@ private[spark] class BlockManager(
     }
   }
 
+  /**
+   * 从本地取数据
+   */
   private def doGetLocal(blockId: BlockId, asBlockResult: Boolean): Option[Any] = {
+    // 首先尝试直接从内存中获取数据
     val info = blockInfo.get(blockId).orNull
     if (info != null) {
+      // 对所有
       info.synchronized {
         // Double check to make sure the block is still there. There is a small chance that the
         // block has been removed by removeBlock (which also synchronizes on the blockInfo object).
