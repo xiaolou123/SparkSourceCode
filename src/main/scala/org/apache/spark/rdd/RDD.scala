@@ -240,7 +240,21 @@ abstract class RDD[T: ClassTag](
    * This should ''not'' be called by users directly, but is available for implementors of custom
    * subclasses of RDD.
    */
+  /**
+   * 先persist(),再checkpoint()，原理如下：
+   * 那么首先执行到该rdd的iterator()之后，会先发现storageLevel != StorageLevel.NONE吧
+   * 那么就会通过CacheManager去获取数据，此时会发现通过BlockManager获取不到数据(因为是第一次执行)
+   * 那么就会第一次还是会计算一次该rdd的数据，然后通过CacheManager的putInBlockManager()将其通过BlockManager进行持久化
+   * rdd所在job运行结束了，然后启动单独job进行checkpoint操作，此时是不是优惠执行到该rdd的iterator()方法
+   * 那么，就会发现持久化级别不为空，默认从BlockManager直接读取持久化数据(正常情况下，应该是可以的吧)
+   * 但是问题是，如果非正常情况下，持久化的数据丢失了
+   * 那么此时会走else()，调用computeOrReadCHeckpoint()方法
+   * 判断如果rdd是isCheckpoint为true,那么就会用它的父rdd的iterator()方法，其实就是从checkpoint外部文件系统中读取数据
+   */
   final def iterator(split: Partition, context: TaskContext): Iterator[T] = {
+    // 这里就是说，如果StoregeLevel不为NONE，就是说，我们之前持久化过RDD
+    // 那么就不要直接从父RDD执行算子，计算新的RDD的partition了
+    // 优先尝试使用CacheManager去获取持久化的数据
     if (storageLevel != StorageLevel.NONE) {
       // CacheManager的东西，先不讲，最后，倒数第二讲，会剖析CacheManager
       SparkEnv.get.cacheManager.getOrCompute(this, split, context, storageLevel)

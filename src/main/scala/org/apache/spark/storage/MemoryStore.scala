@@ -36,6 +36,8 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
   extends BlockStore(blockManager) {
 
   private val conf = blockManager.conf
+  // MemoryStore中维护的entries map，其实就是真的是存放的是每个block的数据了！！
+  // 每个block再内存中的数据，用MenmoryEntry代表
   private val entries = new LinkedHashMap[BlockId, MemoryEntry](32, 0.75f, true)
 
   @volatile private var currentMemory = 0L
@@ -153,14 +155,21 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
   }
 
   override def getBytes(blockId: BlockId): Option[ByteBuffer] = {
+    // entries也是多线程并发访问同步的
     val entry = entries.synchronized {
+      // 尝试从内存中获取block数据
       entries.get(blockId)
     }
+    //如果没有获取到，返回NONE
     if (entry == null) {
       None
-    } else if (entry.deserialized) {
+    }
+    // 如果获取到了非序列化的数据
+    else if (entry.deserialized) {
+      // 调用BlockManager的数据序列化方法，将数据序列化后返回
       Some(blockManager.dataSerialize(blockId, entry.value.asInstanceOf[Array[Any]].iterator))
     } else {
+      // 否则直接返回数据
       Some(entry.value.asInstanceOf[ByteBuffer].duplicate()) // Doesn't actually copy the data
     }
   }
@@ -171,9 +180,13 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
     }
     if (entry == null) {
       None
-    } else if (entry.deserialized) {
+    } 
+    // 如果非序列化，直接返回
+    else if (entry.deserialized) {
       Some(entry.value.asInstanceOf[Array[Any]].iterator)
-    } else {
+    }
+    // 如果序列化了，那么用blockManager进行反序列化，再返回
+    else {
       val buffer = entry.value.asInstanceOf[ByteBuffer].duplicate() // Doesn't actually copy data
       Some(blockManager.dataDeserialize(blockId, buffer))
     }
@@ -259,6 +272,9 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
                 // If the first request is not granted, try again after ensuring free space
                 // If there is still not enough space, give up and drop the partition
                 val spaceToEnsure = maxUnrollMemory - currentUnrollMemory
+                // 反复循环，判断，只要还有数据没有写入内存，并且呢，可以继续尝试往内存中写
+                // 那么久判断，如果内存大小不够存放数据
+                // ok，调用上节课分析过的ensureFreeSpace()方法，尝试清空一些内存空间
                 if (spaceToEnsure > 0) {
                   val result = ensureFreeSpace(blockId, spaceToEnsure)
                   droppedBlocks ++= result.droppedBlocks
@@ -312,6 +328,9 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
    *
    * Return whether put was successful, along with the blocks dropped in the process.
    */
+  /**
+   * 优先放入内存，不行的话，尝试移除部分旧数据，在将block存入
+   */
   private def tryToPut(
       blockId: BlockId,
       value: Any,
@@ -327,14 +346,24 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
     var putSuccess = false
     val droppedBlocks = new ArrayBuffer[(BlockId, BlockStatus)]
 
+    // 这里，也会进行多线程并发同步
+    // 这里的多线程并发同步很重要！！！！
+    // 你要是再这里不进行多线程并发同步的话，那就不好了！！
+    // 因为可能你刚判定内存足够你放，但是其他线程就放入了数据！
+    // 然后此时，你往内存中一放数据，直接OOM，内存溢出
     accountingLock.synchronized {
+      // 调用ensureFreeSpace方法，判断内存是否够用，如果不够用，此时会将部分数据用dropFromMemory()方法
+      // 尝试写入磁盘，但是如果持久化级别不支持磁盘，那么数据丢失
       val freeSpaceResult = ensureFreeSpace(blockId, size)
       val enoughFreeSpace = freeSpaceResult.success
       droppedBlocks ++= freeSpaceResult.droppedBlocks
 
+      // 将数据写入内存的时候，首先调用enoughFreeSpace()方法，判断内存是否足够放入数据
       if (enoughFreeSpace) {
+        // 给数据创建一份MemoryEntry
         val entry = new MemoryEntry(value, size, deserialized)
         entries.synchronized {
+          // 将数据放入内存的entries中
           entries.put(blockId, entry)
           currentMemory += size
         }
@@ -383,6 +412,7 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
     // Take into account the amount of memory currently occupied by unrolling blocks
     val actualFreeMemory = freeMemory - currentUnrollMemory
 
+    // 如果当前内存不足够将这个block放入的话
     if (actualFreeMemory < space) {
       val rddToAdd = getRddId(blockIdToAdd)
       val selectedBlocks = new ArrayBuffer[BlockId]
@@ -391,8 +421,10 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
       // This is synchronized to ensure that the set of entries is not changed
       // (because of getValue or getBytes) while traversing the iterator, as that
       // can lead to exceptions.
+      // 同步entries
       entries.synchronized {
         val iterator = entries.entrySet().iterator()
+        // 尝试从entieszhong，移除一部分数据
         while (actualFreeMemory + selectedMemory < space && iterator.hasNext) {
           val pair = iterator.next()
           val blockId = pair.getKey
@@ -403,8 +435,10 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
         }
       }
 
+      // 判断，如果移除一部分数据之后，就可以存放新得block了
       if (actualFreeMemory + selectedMemory >= space) {
         logInfo(s"${selectedBlocks.size} blocks selected for dropping")
+        // 将之前选择得要移除的block数据，遍历
         for (blockId <- selectedBlocks) {
           val entry = entries.synchronized { entries.get(blockId) }
           // This should never be null as only one thread should be dropping
@@ -416,6 +450,8 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
             } else {
               Right(entry.value.asInstanceOf[ByteBuffer].duplicate())
             }
+            // 调用dropFromMemory方法，尝试将数据写入磁盘，但是如果block的持久化级别没有说可以写入磁盘
+            // 那么数据，就彻底丢了
             val droppedBlockStatus = blockManager.dropFromMemory(blockId, data)
             droppedBlockStatus.foreach { status => droppedBlocks += ((blockId, status)) }
           }

@@ -41,6 +41,8 @@ private[spark] class CacheManager(blockManager: BlockManager) extends Logging {
 
     val key = RDDBlockId(rdd.id, partition.index)
     logDebug(s"Looking for partition $key")
+    
+    // 直接用BlockManager来获取数据，如果获取到了，那就直接返回就好了
     blockManager.get(key) match {
       case Some(blockResult) =>
         // Partition is already materialized, so just return its values
@@ -56,9 +58,16 @@ private[spark] class CacheManager(blockManager: BlockManager) extends Logging {
             delegate.next()
           }
         }
+        
+      // 如果从BlockManager没有获取到数据，虽然rdd持久化过，但是因为位置的原因，数据即不再本地内存或磁盘
+      // 也不再远程BlockManager的本次或磁盘
+      // 要进行后续处理
       case None =>
         // Acquire a lock for loading this partition
         // If another thread already holds the lock, wait for it to finish return its results
+        // 再次调用一次BlockManager的get()方法，去获取数据
+        // 如果获取到了，直接返回数据
+        // 如果没有获取到，那么往后走
         val storedValues = acquireLockForPartition[T](key)
         if (storedValues.isDefined) {
           return new InterruptibleIterator[T](context, storedValues.get)
@@ -67,6 +76,10 @@ private[spark] class CacheManager(blockManager: BlockManager) extends Logging {
         // Otherwise, we have to load the partition ourselves
         try {
           logInfo(s"Partition $key not found, computing it")
+          // 调用computeOrReadCheckpoint()方法，
+          // 如果rdd之前checkpoint过，那么久尝试读取它的checkpoint
+          // 但是如果rdd没有checkpoint过，那么此时就别无选择，只能重新使用父rdd的数据，执行算子
+          // 计算一份
           val computedValues = rdd.computeOrReadCheckpoint(partition, context)
 
           // If the task is running locally, do not persist the result
@@ -76,6 +89,10 @@ private[spark] class CacheManager(blockManager: BlockManager) extends Logging {
 
           // Otherwise, cache the values and keep track of any updates in block statuses
           val updatedBlocks = new ArrayBuffer[(BlockId, BlockStatus)]
+          // 由于走CacheManager，肯定意味着rdd事设置过持久化级别的
+          // 只是因为某些原因，持久化的数据没有找到，那么才会走到这里
+          // 所以读取了checkpoint数据，或者事重新计算数据之后，要用putInBlockManager方法
+          // 将数据在BlockManager中持久化一份
           val cachedValues = putInBlockManager(key, computedValues, storageLevel, updatedBlocks)
           val metrics = context.taskMetrics
           val lastUpdatedBlocks = metrics.updatedBlocks.getOrElse(Seq[(BlockId, BlockStatus)]())
@@ -145,11 +162,13 @@ private[spark] class CacheManager(blockManager: BlockManager) extends Logging {
       effectiveStorageLevel: Option[StorageLevel] = None): Iterator[T] = {
 
     val putLevel = effectiveStorageLevel.getOrElse(level)
+    // 如果持久化级别，没有指定内存级别，仅仅事纯磁盘的级别
     if (!putLevel.useMemory) {
       /*
        * This RDD is not to be cached in memory, so we can just pass the computed values as an
        * iterator directly to the BlockManager rather than first fully unrolling it in memory.
        */
+      // 那么简单，直接调用BlockManager的putIterator()方法，将数据写入磁盘即可
       updatedBlocks ++=
         blockManager.putIterator(key, values, level, tellMaster = true, effectiveStorageLevel)
       blockManager.get(key) match {
@@ -158,7 +177,9 @@ private[spark] class CacheManager(blockManager: BlockManager) extends Logging {
           logInfo(s"Failure to store $key")
           throw new BlockException(key, s"Block manager failed to return cached value for $key!")
       }
-    } else {
+    } 
+    // 如果指定了内存级别了，那么就比较复杂了额
+    else {
       /*
        * This RDD is to be cached in memory. In this case we cannot pass the computed values
        * to the BlockManager as an iterator and expect to read it back later. This is because
@@ -169,6 +190,10 @@ private[spark] class CacheManager(blockManager: BlockManager) extends Logging {
        * single partition. Instead, we unroll the values cautiously, potentially aborting and
        * dropping the partition to disk if applicable.
        */
+      // 这里会调用MemeoryStore的unrollSafely()方法，尝试将数据写入内存
+      // 如果unrollSafely()方法判断数据是可以写入内存的，那么很好
+      // 就将数据写入内存
+      // 但是如果unrollSafely()方法判断某些数据无法写入内存，那么没有办法，只能写入磁盘文件
       blockManager.memoryStore.unrollSafely(key, values, updatedBlocks) match {
         case Left(arr) =>
           // We have successfully unrolled the entire partition, so cache it in memory
@@ -178,6 +203,8 @@ private[spark] class CacheManager(blockManager: BlockManager) extends Logging {
         case Right(it) =>
           // There is not enough space to cache this partition in memory
           val returnValues = it.asInstanceOf[Iterator[T]]
+          // 如果有些数据实在无法写入内存，那么就判断，数据是否有磁盘级别
+          // 如果有的话，那么就用磁盘级别，将数据写入磁盘文件
           if (putLevel.useDisk) {
             logWarning(s"Persisting partition $key to disk instead.")
             val diskOnlyLevel = StorageLevel(useDisk = true, useMemory = false,

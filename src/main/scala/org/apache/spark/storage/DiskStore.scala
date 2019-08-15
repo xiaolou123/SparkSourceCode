@@ -41,6 +41,7 @@ private[spark] class DiskStore(blockManager: BlockManager, diskManager: DiskBloc
   override def putBytes(blockId: BlockId, _bytes: ByteBuffer, level: StorageLevel): PutResult = {
     // So that we do not modify the input offsets !
     // duplicate does not copy buffer, so inexpensive
+    // 使用java nio，将数据写入磁盘文件
     val bytes = _bytes.duplicate()
     logDebug(s"Attempting to put block $blockId")
     val startTime = System.currentTimeMillis
@@ -105,6 +106,7 @@ private[spark] class DiskStore(blockManager: BlockManager, diskManager: DiskBloc
   }
 
   private def getBytes(file: File, offset: Long, length: Long): Option[ByteBuffer] = {
+    // DiskStore，底层使用的是java的nio进行文件的读写操作
     val channel = new RandomAccessFile(file, "r").getChannel
 
     try {

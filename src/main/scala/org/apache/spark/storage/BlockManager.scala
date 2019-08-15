@@ -84,8 +84,8 @@ private[spark] class BlockManager(
 
   // 这里还有一个东西
   // 就是每个BlockManager，自己，会维护一个map
-  // 其中，其实就是相当于，在内存中，存放了数据，一个一个的block块
-  // 每个BlockInfo中，是不是就封装了Block的数据 
+  // 这里维护的BlockInfo，可以用于代表一个block
+  // 然后呢，BlockInfo最大的作用，就是用于作为多线程并发访问同一个Block的同步监视
   private val blockInfo = new TimeStampedHashMap[BlockId, BlockInfo]
 
   // Actual storage of where blocks are kept
@@ -477,10 +477,11 @@ private[spark] class BlockManager(
    * 从本地取数据
    */
   private def doGetLocal(blockId: BlockId, asBlockResult: Boolean): Option[Any] = {
-    // 首先尝试直接从内存中获取数据
+    // 首先尝试获取block对应的BlockInfo的锁 
     val info = blockInfo.get(blockId).orNull
     if (info != null) {
-      // 对所有
+      // 对所有的BlockInfo,都会进行多线程并发访问的同步操作
+      // 所有BlockInfo，相当于是对一个Blcok，用于作为多线程并发访问的同步监视器
       info.synchronized {
         // Double check to make sure the block is still there. There is a small chance that the
         // block has been removed by removeBlock (which also synchronizes on the blockInfo object).
@@ -493,6 +494,9 @@ private[spark] class BlockManager(
         }
 
         // If another thread is writing the block, wait for it to become ready.
+        // 如果其他线程再操作这个block
+        // 那么，其实会卡住，等待，获取BlockInfo的排他锁
+        // 如果始终，没有获取到，返回false，那么就直接返回
         if (!info.waitForReady()) {
           // If we get here, the block write failed.
           logWarning(s"Block $blockId was marked as failure.")
@@ -503,6 +507,9 @@ private[spark] class BlockManager(
         logDebug(s"Level for block $blockId is $level")
 
         // Look for the block in memory
+        // 判断，如果持久化级别使用了内存
+        // 比如MEMORY_ONLY,MEMORY_AND_DISK_SER
+        // 尝试从MemoryStore中获取数据
         if (level.useMemory) {
           logDebug(s"Getting block $blockId from memory")
           val result = if (asBlockResult) {
@@ -563,6 +570,8 @@ private[spark] class BlockManager(
                * but we only requested its serialized bytes. */
               val copyForMemory = ByteBuffer.allocate(bytes.limit)
               copyForMemory.put(bytes)
+              // 如果使用了DISK级别，也是用了MEMORY级别
+              // 那么从disk读取出来之后，其实会尝试将其放入MemoryStore中，也就是缓存到内存中
               memoryStore.putBytes(blockId, copyForMemory, level)
               bytes.rewind()
             }
@@ -614,9 +623,14 @@ private[spark] class BlockManager(
 
   private def doGetRemote(blockId: BlockId, asBlockResult: Boolean): Option[Any] = {
     require(blockId != null, "BlockId is null")
+    // 首先BlockManagerMaster上，获取每个blockId对应的BlockManager的信息
+    // 然后会随机打乱
     val locations = Random.shuffle(master.getLocations(blockId))
+    // 遍历每一个BlockManager
     for (loc <- locations) {
       logDebug(s"Getting remote block $blockId from $loc")
+      // 使用BlockTransferService，进行异步的远程网络获取，将block数据传输回来
+      // 连接的时候，使用的BlockManager的唯一表示，就是host、port、executorId
       val data = blockTransferService.fetchBlockSync(
         loc.host, loc.port, loc.executorId, blockId.toString).nioByteBuffer()
 
@@ -638,6 +652,10 @@ private[spark] class BlockManager(
 
   /**
    * Get a block from the block manager (either local or remote).
+   */
+  /**
+   * 通过BlockManager获取数据的入口方法
+   * 就跟我们上一讲说的BlockManager的工作原理一样，获取的时候，优先从本地获取，如果本地没有，那么从远程获取
    */
   def get(blockId: BlockId): Option[BlockResult] = {
     val local = getLocal(blockId)
@@ -736,6 +754,7 @@ private[spark] class BlockManager(
     /* Remember the block's storage level so that we can correctly drop it to disk if it needs
      * to be dropped right after it got put into memory. Note, however, that other threads will
      * not be able to get() this block until we call markReady on its BlockInfo. */
+    // 为要写入的block，创建一个blockInfo，并将其放入blockInfo map中
     val putBlockInfo = {
       val tinfo = new BlockInfo(level, tellMaster)
       // Do atomically !
@@ -780,6 +799,7 @@ private[spark] class BlockManager(
       case _ => null
     }
 
+    // 尝试对BlockInfo枷锁，进行多线程并发访问同步
     putBlockInfo.synchronized {
       logTrace("Put for block %s took %s to get into synchronized block"
         .format(blockId, Utils.getUsedTimeMs(startTimeMs)))
@@ -788,6 +808,7 @@ private[spark] class BlockManager(
       try {
         // returnValues - Whether to return the values put
         // blockStore - The type of storage to put these values into
+        // 首先根据持久化级别，选择一种BlockStore,MemoryStore,DiskStore等
         val (returnValues, blockStore: BlockStore) = {
           if (putLevel.useMemory) {
             // Put it in memory first, even if it also has useDisk set to true;
@@ -807,6 +828,7 @@ private[spark] class BlockManager(
         }
 
         // Actually put the values
+        // 根据你选择的store，然后根据数据的类型，将数据放入store中
         val result = data match {
           case IteratorValues(iterator) =>
             blockStore.putIterator(blockId, iterator, putLevel, returnValues)
@@ -828,6 +850,7 @@ private[spark] class BlockManager(
           result.droppedBlocks.foreach { updatedBlocks += _ }
         }
 
+        // 获取到一个Block对应的BlockStatus
         val putBlockStatus = getCurrentBlockStatus(blockId, putBlockInfo)
         if (putBlockStatus.storageLevel != StorageLevel.NONE) {
           // Now that the block is in either the memory, tachyon, or disk store,
@@ -835,6 +858,8 @@ private[spark] class BlockManager(
           marked = true
           putBlockInfo.markReady(size)
           if (tellMaster) {
+            // 调用reportBlockStatus()方法，将新写入的block数据发送到BlockManagerMasterActor
+            // 以便于进行block元数据的同步和维护
             reportBlockStatus(blockId, putBlockInfo, putBlockStatus)
           }
           updatedBlocks += ((blockId, putBlockStatus))
@@ -855,6 +880,8 @@ private[spark] class BlockManager(
 
     // Either we're storing bytes and we asynchronously started replication, or we're storing
     // values and need to serialize and replicate them now:
+    // 重要！！
+    // 如果我们的持久化级别，是定义了_2的这种后缀，说明需要对block进行replica，然后传输到其他节点上
     if (putLevel.replication > 1) {
       data match {
         case ByteBufferValues(bytes) =>
@@ -871,6 +898,7 @@ private[spark] class BlockManager(
             }
             bytesAfterPut = dataSerialize(blockId, valuesAfterPut)
           }
+          // 调用replicate()方法，进行复制操作
           replicate(blockId, bytesAfterPut, putLevel)
           logDebug("Put block %s remotely took %s"
             .format(blockId, Utils.getUsedTimeMs(remoteStartTime)))
@@ -932,6 +960,7 @@ private[spark] class BlockManager(
     // So assuming the list of peers does not change and no replication failures,
     // if there are multiple attempts in the same node to replicate the same block,
     // the same set of peers will be selected.
+    // 随机获取一个其他的BlockManager
     def getRandomPeer(): Option[BlockManagerId] = {
       // If replication had failed, then force update the cached list of peers and remove the peers
       // that have been already used
@@ -966,6 +995,7 @@ private[spark] class BlockManager(
             val onePeerStartTime = System.currentTimeMillis
             data.rewind()
             logTrace(s"Trying to replicate $blockId of ${data.limit()} bytes to $peer")
+            // 使用BlockTansferService，将数据异步写入其他的BlockManager上
             blockTransferService.uploadBlockSync(
               peer.host, peer.port, peer.executorId, blockId, new NioManagedBuffer(data), tLevel)
             logTrace(s"Replicated $blockId of ${data.limit()} bytes to $peer in %s ms"
